@@ -2,11 +2,11 @@ USE master;
 GO
 
 -- Create the stored procedure
-IF OBJECT_ID('dbo.usp_BulkBackupDatabases', 'P') IS NOT NULL
-    DROP PROCEDURE dbo.usp_BulkBackupDatabases;
+IF OBJECT_ID('dbo.usp_BulkBackupDatabasesAndLogs', 'P') IS NOT NULL
+    DROP PROCEDURE dbo.usp_BulkBackupDatabasesAndLogs;
 GO
 
-CREATE PROCEDURE dbo.usp_BulkBackupDatabases
+CREATE PROCEDURE dbo.usp_BulkBackupDatabasesAndLogs
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -22,22 +22,33 @@ BEGIN
     IF OBJECT_ID('tempdb..#BackupFailures') IS NOT NULL DROP TABLE #BackupFailures;
     CREATE TABLE #BackupFailures (
         DatabaseName NVARCHAR(128),
+        BackupType NVARCHAR(50),
         ErrorMessage NVARCHAR(MAX),
         BackupTime DATETIME DEFAULT GETDATE()
     );
 
     -- Define backup path
     DECLARE @dbName NVARCHAR(128);
-    DECLARE @BackupPath NVARCHAR(300) = 'C:\SQLBulkBackups\';
+    DECLARE @FullBackupPath NVARCHAR(300) = 'C:\SQLBulkBackups\Full\';
+    DECLARE @LogBackupPath NVARCHAR(300) = 'C:\SQLBulkBackups\Log\';
     
-    -- Check if the backup folder exists, if not, create it
+    -- Check if the Full and Log backup folders exist, if not, create them
     IF NOT EXISTS (
         SELECT 1
         FROM sys.master_files
-        WHERE physical_name LIKE @BackupPath + '%'
+        WHERE physical_name LIKE @FullBackupPath + '%'
     )
     BEGIN
-        EXEC xp_cmdshell 'mkdir C:\SQLBulkBackups\';
+        EXEC xp_cmdshell 'mkdir C:\SQLBulkBackups\Full\';
+    END
+
+    IF NOT EXISTS (
+        SELECT 1
+        FROM sys.master_files
+        WHERE physical_name LIKE @LogBackupPath + '%'
+    )
+    BEGIN
+        EXEC xp_cmdshell 'mkdir C:\SQLBulkBackups\Log\';
     END
 
     -- Loop through all databases and perform backups
@@ -53,20 +64,38 @@ BEGIN
     WHILE @@FETCH_STATUS = 0
     BEGIN
         BEGIN TRY
-            DECLARE @backupFile NVARCHAR(300) = @BackupPath + @dbName + '_' + CONVERT(NVARCHAR(20), GETDATE(), 112) + '.bak';
+            -- FULL BACKUP
+            DECLARE @fullBackupFile NVARCHAR(300) = @FullBackupPath + @dbName + '_Full_' + CONVERT(NVARCHAR(20), GETDATE(), 112) + '.bak';
 
-            -- Perform backup
             BACKUP DATABASE @dbName 
-            TO DISK = @backupFile 
+            TO DISK = @fullBackupFile 
             WITH INIT, STATS = 10, CHECKSUM;
 
-            PRINT 'Backup successful for database: ' + @dbName;
+            PRINT 'Full backup successful for database: ' + @dbName;
+
+            -- Log success for Full Backup in table
+            INSERT INTO #BackupFailures (DatabaseName, BackupType, BackupTime)
+            VALUES (@dbName, 'Full', GETDATE());
+
+            -- TRANSACTION LOG BACKUP
+            DECLARE @logBackupFile NVARCHAR(300) = @LogBackupPath + @dbName + '_Log_' + CONVERT(NVARCHAR(20), GETDATE(), 112) + '.trn';
+
+            BACKUP LOG @dbName 
+            TO DISK = @logBackupFile 
+            WITH INIT, STATS = 10, CHECKSUM;
+
+            PRINT 'Transaction Log backup successful for database: ' + @dbName;
+
+            -- Log success for Log Backup in table
+            INSERT INTO #BackupFailures (DatabaseName, BackupType, BackupTime)
+            VALUES (@dbName, 'Transaction Log', GETDATE());
         END TRY
         BEGIN CATCH
-            INSERT INTO #BackupFailures (DatabaseName, ErrorMessage)
-            VALUES (@dbName, ERROR_MESSAGE());
+            -- Log failure for Full Backup or Transaction Log Backup
+            INSERT INTO #BackupFailures (DatabaseName, BackupType, ErrorMessage, BackupTime)
+            VALUES (@dbName, CASE WHEN ERROR_MESSAGE() LIKE '%LOG%' THEN 'Transaction Log' ELSE 'Full' END, ERROR_MESSAGE(), GETDATE());
 
-            PRINT 'Backup failed for database: ' + @dbName;
+            PRINT 'Backup failed for database: ' + @dbName + ' - ' + ERROR_MESSAGE();
         END CATCH;
 
         FETCH NEXT FROM db_cursor INTO @dbName;
